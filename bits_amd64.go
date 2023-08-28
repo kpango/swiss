@@ -20,7 +20,7 @@ import (
 	"math/bits"
 	_ "unsafe"
 
-	"github.com/dolthub/swiss/simd"
+	"github.com/kpango/swiss/simd"
 )
 
 const (

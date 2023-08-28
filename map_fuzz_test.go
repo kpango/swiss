@@ -16,7 +16,6 @@ package swiss
 
 import (
 	"testing"
-	"unsafe"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -50,8 +49,6 @@ func fuzzTestStringMap(t *testing.T, keySz, init, count uint32) {
 		return
 	}
 	// make tests deterministic
-	setConstSeed(m, 1)
-
 	keys := genStringData(int(keySz), int(count))
 	golden := make(map[string]int, init)
 	for i, k := range keys {
@@ -91,9 +88,4 @@ func fuzzTestStringMap(t *testing.T, keySz, init, count uint32) {
 type hasher struct {
 	hash func()
 	seed uintptr
-}
-
-func setConstSeed[K comparable, V any](m *Map[K, V], seed uintptr) {
-	h := (*hasher)((unsafe.Pointer)(&m.hash))
-	h.seed = seed
 }

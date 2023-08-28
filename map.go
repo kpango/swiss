@@ -15,22 +15,29 @@
 package swiss
 
 import (
-	"github.com/dolthub/maphash"
+	"sync"
+
+	"github.com/zeebo/xxh3"
 )
 
 const (
-	maxLoadFactor = float32(maxAvgGroupLoad) / float32(groupSize)
+	maxLoadFactor  = float32(maxAvgGroupLoad) / float32(groupSize)
+	probeCacheSize = 128
 )
 
 // Map is an open-addressing hash map
 // based on Abseil's flat_hash_map.
 type Map[K comparable, V any] struct {
-	ctrl     []metadata
-	groups   []group[K, V]
-	hash     maphash.Hasher[K]
-	resident uint32
-	dead     uint32
-	limit    uint32
+	ctrl       []metadata
+	cpool      sync.Pool
+	groups     []group[K, V]
+	gpool      sync.Pool
+	resident   uint32
+	dead       uint32
+	limit      uint32
+	probeCache [probeCacheSize]uint32
+	emptyK     K
+	emptyV     V
 }
 
 // metadata is the h2 metadata array for a group.
@@ -49,6 +56,7 @@ const (
 	h2Mask    uint64 = 0x0000_0000_0000_007f
 	empty     int8   = -128 // 0b1000_0000
 	tombstone int8   = -2   // 0b1111_1110
+
 )
 
 // h1 is a 57 bit hash prefix
@@ -63,7 +71,8 @@ func NewMap[K comparable, V any](sz uint32) (m *Map[K, V]) {
 	m = &Map[K, V]{
 		ctrl:   make([]metadata, groups),
 		groups: make([]group[K, V], groups),
-		hash:   maphash.NewHasher[K](),
+		gpool:  sync.Pool{New: func() interface{} { return group[K, V]{} }},
+		cpool:  sync.Pool{New: func() interface{} { return metadata{} }},
 		limit:  groups * maxAvgGroupLoad,
 	}
 	for i := range m.ctrl {
@@ -74,7 +83,7 @@ func NewMap[K comparable, V any](sz uint32) (m *Map[K, V]) {
 
 // Has returns true if |key| is present in |m|.
 func (m *Map[K, V]) Has(key K) (ok bool) {
-	hi, lo := splitHash(m.hash.Hash(key))
+	hi, lo := splitHash(xxh3.HashString(key))
 	g := probeStart(hi, len(m.groups))
 	for { // inlined find loop
 		matches := metaMatchH2(&m.ctrl[g], lo)
@@ -101,7 +110,7 @@ func (m *Map[K, V]) Has(key K) (ok bool) {
 
 // Get returns the |value| mapped by |key| if one exists.
 func (m *Map[K, V]) Get(key K) (value V, ok bool) {
-	hi, lo := splitHash(m.hash.Hash(key))
+	hi, lo := splitHash(xxh3.HashString(key))
 	g := probeStart(hi, len(m.groups))
 	for { // inlined find loop
 		matches := metaMatchH2(&m.ctrl[g], lo)
@@ -131,7 +140,7 @@ func (m *Map[K, V]) Put(key K, value V) {
 	if m.resident >= m.limit {
 		m.rehash(m.nextSize())
 	}
-	hi, lo := splitHash(m.hash.Hash(key))
+	hi, lo := splitHash(xxh3.HashString(key))
 	g := probeStart(hi, len(m.groups))
 	for { // inlined find loop
 		matches := metaMatchH2(&m.ctrl[g], lo)
@@ -163,7 +172,7 @@ func (m *Map[K, V]) Put(key K, value V) {
 
 // Delete attempts to remove |key|, returns true successful.
 func (m *Map[K, V]) Delete(key K) (ok bool) {
-	hi, lo := splitHash(m.hash.Hash(key))
+	hi, lo := splitHash(xxh3.HashString(key))
 	g := probeStart(hi, len(m.groups))
 	for {
 		matches := metaMatchH2(&m.ctrl[g], lo)
@@ -239,15 +248,11 @@ func (m *Map[K, V]) Clear() {
 	for i, c := range m.ctrl {
 		for j := range c {
 			m.ctrl[i][j] = empty
+			m.groups[i].keys[j] = m.emptyK
+			m.groups[i].values[j] = m.emptyV
 		}
-	}
-	var k K
-	var v V
-	for _, g := range m.groups {
-		for i := range g.keys {
-			g.keys[i] = k
-			g.values[i] = v
-		}
+		m.gpool.Put(&m.groups[i])
+		m.cpool.Put(&m.ctrl[i])
 	}
 	m.resident, m.dead = 0, 0
 }
@@ -266,7 +271,13 @@ func (m *Map[K, V]) Capacity() int {
 // find returns the location of |key| if present, or its insertion location if absent.
 // for performance, find is manually inlined into public methods.
 func (m *Map[K, V]) find(key K, hi h1, lo h2) (g, s uint32, ok bool) {
-	g = probeStart(hi, len(m.groups))
+	cacheIndex := uint32(hi) % probeCacheSize
+	if cached := m.probeCache[cacheIndex]; cached != 0 {
+		g = cached
+	} else {
+		g = probeStart(hi, len(m.groups))
+		m.probeCache[cacheIndex] = g
+	}
 	for {
 		matches := metaMatchH2(&m.ctrl[g], lo)
 		for matches != 0 {
@@ -302,25 +313,34 @@ func (m *Map[K, V]) rehash(n uint32) {
 	m.groups = make([]group[K, V], n)
 	m.ctrl = make([]metadata, n)
 	for i := range m.ctrl {
-		m.ctrl[i] = newEmptyMetadata()
+		m.ctrl[i] = m.cpool.Get().(metadata)
+		m.groups[i] = m.gpool.Get().(group[K, V])
 	}
-	m.hash = maphash.NewSeed(m.hash)
 	m.limit = n * maxAvgGroupLoad
 	m.resident, m.dead = 0, 0
 	for g := range ctrl {
 		for s := range ctrl[g] {
 			c := ctrl[g][s]
 			if c == empty || c == tombstone {
+				ctrl[g][s] = empty
 				continue
 			}
 			m.Put(groups[g].keys[s], groups[g].values[s])
+			ctrl[g][s] = empty
+			groups[g].keys[s] = m.emptyK
+			groups[g].values[s] = m.emptyV
 		}
+		m.gpool.Put(&groups[g])
+		m.cpool.Put(&ctrl[g])
 	}
 }
 
 func (m *Map[K, V]) loadFactor() float32 {
-	slots := float32(len(m.groups) * groupSize)
-	return float32(m.resident-m.dead) / slots
+	return float32(m.resident-m.dead) / float32(len(m.groups)*groupSize)
+}
+
+func (m *Map[K, V]) hash(key K) uint64 {
+	// xxh3.HashString(key)
 }
 
 // numGroups returns the minimum number of groups needed to store |n| elems.
